@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::{SocketAddr, ToSocketAddrs},
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use crate::runtime::{HttpProxyErr, HttpReceivable};
 
@@ -47,7 +42,10 @@ impl ProxtRule for ProxyRuleHost {
     }
 
     fn rewrite(&self, request: &mut Request) {
-        request.header.headers.insert("Host".into(), self.to.clone());
+        request
+            .header
+            .headers
+            .insert("Host".into(), self.to.clone());
     }
 }
 
@@ -92,10 +90,9 @@ impl HttpReceivable for Request {
         let (headers, size) = parse_headers(slice_headers)?;
 
         // Validate that Host header is in a request
-        if headers.get("Host").is_none(){
+        if headers.get("Host").is_none() {
             return Err(HttpProxyErr::UnexpectedHeaderFormat);
         }
-
 
         let header = RequestHeader {
             version,
