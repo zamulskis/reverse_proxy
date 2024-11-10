@@ -1,9 +1,9 @@
 use std::{
     cell::RefCell,
     io::{self, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{TcpListener, TcpStream},
     rc::Rc,
-    str::FromStr,
+    str,
     sync::{mpsc, Arc, Mutex},
     thread::sleep,
     time::Duration,
@@ -34,9 +34,17 @@ pub trait HttpReceivable: Clone {
 }
 
 enum HttpMessage<T: HttpReceivable> {
-    New(Vec<u8>),
+    Unparsed(Vec<u8>),
+    WebSocket(Vec<u8>),
     HeaderParsed(T),
     Ready(T),
+}
+
+#[derive(PartialEq)]
+enum StreamHandleMode {
+    Http,
+    UpgradeWebsocket,
+    WebSocket,
 }
 
 struct HttpMessageHandle<T: HttpReceivable> {
@@ -48,6 +56,13 @@ struct ResponseStreamHandle {
     client: std::rc::Weak<RefCell<TcpStream>>,
     messages: Vec<HttpMessageHandle<Response>>,
     host: Box<str>,
+    mode: StreamHandleMode,
+}
+
+struct RequestStreamHandle {
+    client: Rc<RefCell<TcpStream>>,
+    messages: Vec<HttpMessageHandle<Request>>,
+    mode: StreamHandleMode,
 }
 
 impl<T: HttpReceivable> HttpMessageHandle<T> {
@@ -58,7 +73,7 @@ impl<T: HttpReceivable> HttpMessageHandle<T> {
 
 impl<T: HttpReceivable> Default for HttpMessageHandle<T> {
     fn default() -> Self {
-        let message: HttpMessage<T> = HttpMessage::New(Vec::new());
+        let message: HttpMessage<T> = HttpMessage::Unparsed(Vec::new());
         HttpMessageHandle { message }
     }
 }
@@ -82,12 +97,31 @@ pub fn acceptor(port: u32, stream_tx: mpsc::Sender<TcpStream>) {
         }
     }
 }
+fn manage_connections(
+    requests: &mut Vec<RequestStreamHandle>,
+    responses: &mut Vec<ResponseStreamHandle>,
+) {
+    // Upgrade to websocket protocol
+    for request_handle in requests {
+        if request_handle.mode == StreamHandleMode::UpgradeWebsocket {
+            if let Some(position) = responses.iter().position(|x| {
+                std::rc::Weak::ptr_eq(&Rc::downgrade(&request_handle.client), &x.client)
+            }) {
+                let response_handle = responses.get_mut(position).unwrap();
+                if response_handle.mode == StreamHandleMode::UpgradeWebsocket {
+                    request_handle.mode = StreamHandleMode::WebSocket;
+                    response_handle.mode = StreamHandleMode::WebSocket;
+                }
+            }
+        }
+    }
+}
 
 pub fn request_handler(
     proxy_rules: Arc<Mutex<(usize, ProxyRules)>>,
     stream_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
 ) {
-    let mut requests: Vec<(Rc<RefCell<TcpStream>>, Vec<HttpMessageHandle<Request>>)> = Vec::new();
+    let mut requests: Vec<RequestStreamHandle> = Vec::new();
     let mut responses: Vec<ResponseStreamHandle> = Vec::new();
     // #TODO Do inside a loop every 5 mintes
     let rules = match proxy_rules.lock() {
@@ -100,19 +134,24 @@ pub fn request_handler(
         send_out_requests(&mut requests, &mut responses, &rules);
         process_responses(&mut responses);
         send_out_responses(&mut responses);
+        manage_connections(&mut requests, &mut responses);
         sleep(Duration::new(0, 1000));
     }
 }
 
 fn register_new_clients(
-    client_streams: &mut Vec<(Rc<RefCell<TcpStream>>, Vec<HttpMessageHandle<Request>>)>,
+    client_streams: &mut Vec<RequestStreamHandle>,
     stream_rx: &Arc<Mutex<mpsc::Receiver<TcpStream>>>,
 ) {
     match stream_rx.try_lock() {
         Ok(stream_rx) => {
             while match stream_rx.try_recv() {
                 Ok(stream) => {
-                    client_streams.push((Rc::new(RefCell::new(stream)), Vec::new()));
+                    client_streams.push(RequestStreamHandle {
+                        client: Rc::new(RefCell::new(stream)),
+                        messages: Vec::new(),
+                        mode: StreamHandleMode::Http,
+                    });
                     true
                 }
                 Err(mpsc::TryRecvError::Empty) => false,
@@ -125,20 +164,27 @@ fn register_new_clients(
         Err(_) => panic!("Failed to lock stream_rx"),
     }
 }
+fn check_for_websocket_upgrade<T: HttpReceivable>(request: &T) -> bool {
+    match request.get_headers().get("Upgrade") {
+        Some(upgrade) => &upgrade[..] == "websocket",
+        None => false,
+    }
+}
 
-fn process_requests(
-    request_list: &mut Vec<(Rc<RefCell<TcpStream>>, Vec<HttpMessageHandle<Request>>)>,
-) {
+fn process_requests(request_list: &mut Vec<RequestStreamHandle>) {
     let mut index = 0;
     while index < request_list.len() {
-        let (stream, stream_requests) = request_list.get_mut(index).unwrap();
-        if stream_requests.is_empty() {
-            stream_requests.push(HttpMessageHandle::default());
+        let request_stream_handle = request_list.get_mut(index).unwrap();
+        if request_stream_handle.messages.is_empty() {
+            request_stream_handle
+                .messages
+                .push(HttpMessageHandle::default());
         }
 
-        let stream = stream.clone();
+        let stream = request_stream_handle.client.clone();
 
         let mut buf = [0; 8096];
+
         match stream.borrow_mut().read(&mut buf) {
             Ok(0) => {
                 request_list.remove(index);
@@ -147,11 +193,23 @@ fn process_requests(
             Ok(size) => {
                 let mut packet = &buf[..size];
                 loop {
-                    let request = stream_requests.last_mut().unwrap();
-                    let result = process_http_receivable(packet, request);
+                    let request = request_stream_handle.messages.last_mut().unwrap();
+                    let result = match request_stream_handle.mode {
+                        StreamHandleMode::Http | StreamHandleMode::UpgradeWebsocket => {
+                            process_http_receivable(packet, request)
+                        }
+                        StreamHandleMode::WebSocket => {
+                            process_websocket_receivable(packet, request)
+                        }
+                    };
 
-                    if let HttpMessage::Ready(_) = request.message {
-                        stream_requests.push(HttpMessageHandle::default());
+                    if let HttpMessage::Ready(ref message) = request.message {
+                        if check_for_websocket_upgrade(message) {
+                            request_stream_handle.mode = StreamHandleMode::UpgradeWebsocket;
+                        }
+                        request_stream_handle
+                            .messages
+                            .push(HttpMessageHandle::default());
                     }
 
                     match result {
@@ -181,58 +239,76 @@ fn process_requests(
 }
 
 fn send_out_requests(
-    requests: &mut Vec<(Rc<RefCell<TcpStream>>, Vec<HttpMessageHandle<Request>>)>,
+    requests: &mut Vec<RequestStreamHandle>,
     responses: &mut Vec<ResponseStreamHandle>,
     proxy_rules: &ProxyRules,
 ) {
-    for (client_stream, request_list) in requests {
-        request_list.retain_mut(|request_element| {
-            if let HttpMessage::Ready(ref mut request) = request_element.message {
-               
-                // TODO handle this..
-                proxy_rewrite_request(request, proxy_rules);
-                let host = request
-                    .get_headers()
-                    .get("Host")
-                    .expect("No Host in request");
+    for stream_handle in requests {
+        stream_handle.messages.retain_mut(|request_element| {
+            match request_element.message {
+                HttpMessage::Ready(ref mut request) => {
+                    // TODO handle this..
+                    proxy_rewrite_request(request, proxy_rules);
+                    let host = request
+                        .get_headers()
+                        .get("Host")
+                        .expect("No Host in request");
 
-                if request.get_http_version() == &HttpVersion::HTTPv1_1 {
-                    // Try find existing TcpStream to the server from the same client stream.
-                    if let Some(position) = responses.iter().position(|x| {
-                        std::rc::Weak::ptr_eq(&Rc::downgrade(&client_stream), &x.client)
-                            && &x.host == host
-                    }) {
-                        let _ = send_http_request(
-                            &request,
-                            &mut responses.get_mut(position).unwrap().endpoint,
-                        );
-                        return false;
+                    if request.get_http_version() == &HttpVersion::HTTPv1_1 {
+                        // Try find existing TcpStream to the server from the same client stream.
+                        if let Some(position) = responses.iter().position(|x| {
+                            std::rc::Weak::ptr_eq(&Rc::downgrade(&stream_handle.client), &x.client)
+                                && &x.host == host
+                        }) {
+                            let _ = send_http_request(
+                                &request,
+                                &mut responses.get_mut(position).unwrap().endpoint,
+                            );
+                            return false;
+                        }
                     }
+                    if let Ok(stream) = send_http_request_new_stream(&request) {
+                        responses.push(ResponseStreamHandle {
+                            endpoint: stream,
+                            client: Rc::downgrade(&stream_handle.client),
+                            messages: Vec::new(),
+                            host: request.get_headers().get("Host").unwrap().clone(),
+                            mode: StreamHandleMode::Http,
+                        });
+                    }
+                    return false;
                 }
-                if let Ok(stream) = send_http_request_new_stream(&request) {
-                    responses.push(ResponseStreamHandle {
-                        endpoint: stream,
-                        client: Rc::downgrade(client_stream),
-                        messages: Vec::new(),
-                        host: request.get_headers().get("Host").unwrap().clone(),
-                    });
+                HttpMessage::WebSocket(ref buffer) => {
+                    match responses.iter().position(|x| {
+                        std::rc::Weak::ptr_eq(&Rc::downgrade(&stream_handle.client), &x.client)
+                    }) {
+                        Some(position) => {
+                            let _ = send_ws_request(
+                                &buffer,
+                                &mut responses.get_mut(position).unwrap().endpoint,
+                            );
+                            return false;
+                        }
+                        None => {
+                            return true;
+                        }
+                    };
                 }
-                return false;
+                _ => return true, // Keep all requests that are not ready to be sent out yet.
             }
-            // Keep all requests that are not ready to be sent out yet.
-            return true;
         })
     }
 }
-fn process_responses(
-    response_list: &mut Vec<ResponseStreamHandle>,
-) {
+
+fn process_responses(response_list: &mut Vec<ResponseStreamHandle>) {
     let mut buf = [0; 8096];
     let mut index = 0;
     while index < response_list.len() {
         let response_stream_handle = response_list.get_mut(index).unwrap();
         if response_stream_handle.messages.is_empty() {
-            response_stream_handle.messages.push(HttpMessageHandle::default());
+            response_stream_handle
+                .messages
+                .push(HttpMessageHandle::default());
         }
         match response_stream_handle.endpoint.read(&mut buf) {
             Ok(0) => {
@@ -248,9 +324,23 @@ fn process_responses(
                 let mut packet = &buf[..size];
                 loop {
                     let response = response_stream_handle.messages.last_mut().unwrap();
-                    let result = process_http_receivable(packet, response);
-                    if let HttpMessage::Ready(_) = response.message {
-                        response_stream_handle.messages.push(HttpMessageHandle::default());
+                    let result = match response_stream_handle.mode {
+                        StreamHandleMode::Http | StreamHandleMode::UpgradeWebsocket => {
+                            process_http_receivable(packet, response)
+                        }
+                        StreamHandleMode::WebSocket => {
+                            process_websocket_receivable(packet, response)
+                        }
+                    };
+
+                    if let HttpMessage::Ready(ref message) = response.message {
+                        if check_for_websocket_upgrade(message) {
+                            response_stream_handle.mode = StreamHandleMode::UpgradeWebsocket;
+                        }
+
+                        response_stream_handle
+                            .messages
+                            .push(HttpMessageHandle::default());
                     }
                     match result {
                         Ok(size) => {
@@ -260,7 +350,9 @@ fn process_responses(
                             packet = &packet[size..];
                         }
                         Err(_) => {
-                            if let Some(client) = std::rc::Weak::upgrade(&response_stream_handle.client) {
+                            if let Some(client) =
+                                std::rc::Weak::upgrade(&response_stream_handle.client)
+                            {
                                 _ = client.borrow_mut().shutdown(std::net::Shutdown::Both);
                             }
 
@@ -293,18 +385,31 @@ fn send_out_responses(responses: &mut Vec<ResponseStreamHandle>) {
         let response_stream_handle = responses.get_mut(index).unwrap();
         match response_stream_handle.client.upgrade() {
             Some(client_stream) => response_stream_handle.messages.retain(|response_handler| {
-                if let HttpMessage::Ready(ref response) = response_handler.message {
-                    let buf: Box<[u8]> = Box::from(response);
-                    // TODO handle this..
-                    client_stream.borrow_mut().write(&buf[..]);
-                    return false;
+                match response_handler.message {
+                    HttpMessage::Ready(ref response) => {
+                        let buf: Box<[u8]> = Box::from(response);
+                        // TODO handle this..
+                        _ = client_stream.borrow_mut().write(&buf[..]);
+                        return false;
+                    }
+                    HttpMessage::WebSocket(ref buffer) => {
+                        _ = client_stream.borrow_mut().write(&buffer);
+                        return false;
+                    }
+                    _ => return true,
                 }
-                // Keep all responses that are not ready to be sent out yet.
-                return true;
             }),
             None => response_stream_handle.messages.clear(),
         }
         index += 1;
+    }
+}
+fn send_ws_request(packet: &[u8], stream: &mut TcpStream) -> Result<(), HttpProxyErr> {
+    match stream.write(&packet) {
+        Ok(_) => {
+            return Ok(());
+        }
+        Err(_) => return Err(HttpProxyErr::UnnableToConnect),
     }
 }
 
@@ -345,7 +450,7 @@ fn process_http_receivable<T: HttpReceivable>(
     receivable_handle: &mut HttpMessageHandle<T>,
 ) -> Result<usize, HttpProxyErr> {
     match receivable_handle.message {
-        HttpMessage::New(ref mut buffer) => {
+        HttpMessage::Unparsed(ref mut buffer) => {
             let initial_buffer_len = buffer.len();
             buffer.extend(packet.iter());
             match T::parse_headers(&buffer) {
@@ -393,5 +498,22 @@ fn process_http_receivable<T: HttpReceivable>(
             return Ok(content_missing_len);
         }
         HttpMessage::Ready(_) => panic!("Trying to process ready request"),
+        HttpMessage::WebSocket(_) => {
+            panic!("Websocket should not be handled by process_http_receivable")
+        }
+    }
+}
+
+fn process_websocket_receivable<T: HttpReceivable>(
+    packet: &[u8],
+    receivable_handle: &mut HttpMessageHandle<T>,
+) -> Result<usize, HttpProxyErr> {
+    match receivable_handle.message {
+        HttpMessage::Unparsed(ref mut buffer) => {
+            buffer.extend(packet);
+            receivable_handle.message = HttpMessage::WebSocket(buffer.clone());
+            Ok(packet.len())
+        }
+        _ => panic!("Websocket packets should be ready the moment they are created"),
     }
 }

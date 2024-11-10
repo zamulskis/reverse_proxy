@@ -14,11 +14,10 @@ mod runtime;
 const WORKER_THREAD_COUNT: usize = 4;
 fn main() {
     let proxy_rules: Arc<Mutex<(usize, ProxyRules)>> = Arc::new(Mutex::new((0, Vec::new())));
-    proxy_rules
-        .lock()
-        .unwrap()
-        .1
-        .push(ProxyRuleHost::new("127.0.0.1:8080", "0.0.0.0:8081"));
+    proxy_rules.lock().unwrap().1.push(ProxyRuleHost::new(
+        "127.0.0.1:8080",
+        "homeassistant.local:8123",
+    ));
 
     let mut worker_thread_list: Vec<JoinHandle<()>> = Vec::new();
     let (stream_tx, stream_rx): (mpsc::Sender<TcpStream>, mpsc::Receiver<TcpStream>) =
