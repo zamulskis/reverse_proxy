@@ -190,7 +190,7 @@ fn parse_server_object(
                 _ => {
                     return Err(ProxyConfigError::ConfigParamInvalid(
                         "listener".into(),
-                        "parameter should be a String".into(),
+                        "parameter has to be a String ".into(),
                     ))
                 }
             };
@@ -205,7 +205,7 @@ fn parse_server_object(
                 _ => {
                     return Err(ProxyConfigError::ConfigParamInvalid(
                         "worker_count".into(),
-                        "paramter has be a Number".into(),
+                        "paramter has to be a Number".into(),
                     ))
                 }
             };
@@ -253,7 +253,9 @@ fn parse_proxy_rules(
     Ok(Arc::new(Mutex::new(proxy_config)))
 }
 
-fn parse_config_rule(object: &JsonValue) -> Result<Box<dyn ProxyRule + Send + Sync>, ProxyConfigError> {
+fn parse_config_rule(
+    object: &JsonValue,
+) -> Result<Box<dyn ProxyRule + Send + Sync>, ProxyConfigError> {
     match object {
         JsonValue::Object(object) => {
             let rule_type = match object["type"] {
@@ -278,6 +280,207 @@ fn parse_config_rule(object: &JsonValue) -> Result<Box<dyn ProxyRule + Send + Sy
             return Err(ProxyConfigError::BadConfigFormat(
                 "proxy_rule paramter should be an object".into(),
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+
+    use crate::runtime::HttpProxyErr;
+
+    use super::*;
+
+    #[test]
+    fn test_json_parse_config_rule() {
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "from": "127.0.0.1:8080",
+                "to": "test_host.com:1234"
+            }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        assert!(json_input.is_object());
+        let rule = parse_config_rule(&json_input);
+        assert!(rule.is_ok());
+    }
+
+    #[test]
+    fn test_json_parse_proxy_rule_host() {
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "from": "127.0.0.1:8080",
+                "to": "test_host.com:123"
+            }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        let proxy_rule = match json_input {
+            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            _ => {
+                assert!(false);
+                return;
+            }
+        };
+        assert!(proxy_rule.is_ok());
+        let proxy_rule = proxy_rule.unwrap();
+        assert!(proxy_rule.from == "127.0.0.1:8080".into());
+        assert!(proxy_rule.to == "test_host.com:123".into());
+    }
+
+    #[test]
+    fn test_json_parse_server() {
+        let input = r#"
+        {
+            "test" : {
+                "listener": "127.0.0.1:8081",
+                "worker_count": 5,
+                "proxy_rules": [
+                    {
+                        "type": "proxy_rule_host",
+                        "from": "127.0.0.1:8081",
+                        "to": "google.com:443"
+                    },
+                    {
+                        "type": "proxy_rule_host",
+                        "from": "localhost:8081",
+                        "to": "1.1.1.1:8123"
+                    }
+                ]
+            }
+        }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        match parse_server_object("test", &json_input["test"]) {
+            Ok(server_config) => {
+                assert!(server_config.server_name == "test".into());
+                assert!(server_config.listener_addr == "127.0.0.1:8081".parse().unwrap());
+                assert!(server_config.worker_count == 5);
+                assert!(server_config.proxy_rules.lock().unwrap().rules.len() == 2);
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn test_json_parse_config() {
+        let input = r#"
+        {
+            "test" : {
+                "listener": "127.0.0.1:8081",
+                "worker_count": 5,
+                "proxy_rules": [
+                    {
+                        "type": "proxy_rule_host",
+                        "from": "127.0.0.1:8081",
+                        "to": "google.com:443"
+                    }
+                ]
+            },
+            "test2" : {
+                "listener": "127.0.0.1:8081",
+                "worker_count": 2,
+                "proxy_rules": [
+                    {
+                        "type": "proxy_rule_host",
+                        "from": "127.0.0.1:8081",
+                        "to": "google.com:443"
+                    },
+                    {
+                        "type": "proxy_rule_host",
+                        "from": "localhost:8081",
+                        "to": "1.1.1.1:8123"
+                    }
+                ]
+            }
+        }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+
+        match parse_config_json(&json_input) {
+            Ok(config) => {
+                assert!(config.len() == 2);
+                assert!(config.first().unwrap().worker_count == 5);
+                assert!(config.first().unwrap().proxy_rules.lock().unwrap().rules.len() == 1);
+                assert!(config.first().unwrap().server_name == "test".into());
+
+                assert!(config.last().unwrap().server_name == "test2".into());
+                assert!(config.last().unwrap().worker_count == 2);
+                assert!(config.last().unwrap().proxy_rules.lock().unwrap().rules.len() == 2);
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    #[test]
+    fn test_json_parse_proxy_rule_host_failed() {
+        // Fail because from not present
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "fro": "127.0.0.1:8080",
+                "to": "test_host.com:123"
+            }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        let proxy_rule = match json_input {
+            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            _ => {
+                assert!(false);
+                return;
+            }
+        };
+        assert!(proxy_rule.is_err());
+
+        match proxy_rule.err().unwrap() {
+            ProxyConfigError::ConfigParamInvalid(param_name, _) => {
+                assert!(param_name == "proxy_rule->from".into());
+            }
+            _ => panic!("Bad error type"),
+        }
+
+        // Fail because to is not present
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "from": "127.0.0.1:8080",
+                "t": "test_host.com:123"
+            }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        let proxy_rule = match json_input {
+            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            _ => {
+                assert!(false);
+                return;
+            }
+        };
+        assert!(proxy_rule.is_err());
+        match proxy_rule.err().unwrap() {
+            ProxyConfigError::ConfigParamInvalid(param_name, _) => {
+                assert!(param_name == "proxy_rule->to".into());
+            }
+            _ => panic!("Bad error type"),
+        }
+
+        // Fail because from is not a string
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "from": 5,
+                "to": "test_host.com:123"
+            }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        let proxy_rule = match json_input {
+            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            _ => {
+                assert!(false);
+                return;
+            }
+        };
+        assert!(proxy_rule.is_err());
+        match proxy_rule.err().unwrap() {
+            ProxyConfigError::ConfigParamInvalid(param_name, _) => {
+                assert!(param_name == "proxy_rule->from".into());
+            }
+            _ => panic!("Bad error type"),
         }
     }
 }
