@@ -1,0 +1,44 @@
+{
+    "example_config_1" : {
+        "listener": "127.0.0.1:8080",
+        "worker_count": 5,
+        "proxy_rules": [
+            {
+                "type": "proxy_rule_host",
+                "from": "127.0.0.1:8080",
+                "to": "homeassistant.local:32400"
+            },
+            {
+                "type": "proxy_rule_host",
+                "from": "0.0.0.0:8080",
+                "to": "homeassistant.local:32400"
+            },
+            {
+                "type": "proxy_rule_host",
+                "from": "localhost:8080",
+                "to": "homeassistant.local:32400"
+            }
+        ]
+    },
+    "example_config_2" : {
+        "listener": "127.0.0.1:8081",
+        "worker_count": 5,
+        "proxy_rules": [
+            {
+                "type": "proxy_rule_host",
+                "from": "127.0.0.1:8081",
+                "to": "homeassistant.local:8123"
+            },
+            {
+                "type": "proxy_rule_host",
+                "from": "0.0.0.0:8081",
+                "to": "homeassistant.local:8123"
+            },
+            {
+                "type": "proxy_rule_host",
+                "from": "localhost:8081",
+                "to": "homeassistant.local:8123"
+            }
+        ]
+    }   
+}

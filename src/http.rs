@@ -1,9 +1,10 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr};
 
-use crate::runtime::{HttpProxyErr, HttpReceivable};
+use crate::config::ProxyConfig;
+use crate::runtime::HttpReceivable;
+use crate::runtime::HttpProxyErr;
 
 pub type Headers = HashMap<Box<str>, Box<str>>;
-pub type ProxyRules = Vec<Arc<dyn ProxtRule + Send + Sync>>;
 #[derive(Clone, PartialEq)]
 pub enum HttpVersion {
     HTTPv1,
@@ -17,37 +18,7 @@ enum HttpMethod {
     POST,
 }
 
-pub trait ProxtRule {
-    fn matches(&self, request: &Request) -> bool;
-    fn rewrite(&self, request: &mut Request);
-}
 
-pub struct ProxyRuleHost {
-    from: Box<str>,
-    to: Box<str>,
-}
-
-impl ProxyRuleHost {
-    pub fn new(from: &str, to: &str) -> Arc<Self> {
-        Arc::new(ProxyRuleHost {
-            from: from.into(),
-            to: to.into(),
-        })
-    }
-}
-
-impl ProxtRule for ProxyRuleHost {
-    fn matches(&self, request: &Request) -> bool {
-        return request.header.headers.get("Host").unwrap() == &self.from;
-    }
-
-    fn rewrite(&self, request: &mut Request) {
-        request
-            .header
-            .headers
-            .insert("Host".into(), self.to.clone());
-    }
-}
 
 #[derive(Clone)]
 pub struct RequestHeader {
@@ -115,6 +86,10 @@ impl HttpReceivable for Request {
         &self.header.headers
     }
 
+    fn set_headers(&mut self, key: &str, value:&str) {
+        self.header.headers.insert(key.into(), value.into());
+    }
+
     fn get_http_version(&self) -> &HttpVersion {
         return &self.header.version;
     }
@@ -154,6 +129,10 @@ impl HttpReceivable for Response {
 
     fn get_http_version(&self) -> &HttpVersion {
         return &self.header.version;
+    }
+
+    fn set_headers(&mut self, key: &str, value:&str) {
+        self.header.headers.insert(key.into(), value.into());
     }
 }
 
@@ -244,9 +223,9 @@ impl From<&Response> for Box<[u8]> {
 }
 pub fn proxy_rewrite_request(
     request: &mut Request,
-    proxy_rules: &ProxyRules,
+    proxy_rules: &ProxyConfig,
 ) -> Result<(), HttpProxyErr> {
-    for rule in proxy_rules {
+    for rule in proxy_rules.rules.iter() {
         if rule.matches(&request) {
             rule.rewrite(request);
             return Ok(());

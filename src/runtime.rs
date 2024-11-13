@@ -1,16 +1,10 @@
 use std::{
-    cell::RefCell,
-    io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
-    rc::Rc,
-    str,
-    sync::{mpsc, Arc, Mutex},
-    thread::sleep,
-    time::Duration,
+    cell::RefCell, io::{self, Read, Write}, net::{SocketAddr, TcpListener, TcpStream}, rc::Rc, sync::{mpsc, Arc, Mutex}, thread::sleep, time::Duration
 };
 
-use crate::http::{
-    get_content_length, proxy_rewrite_request, Headers, HttpVersion, ProxyRules, Request, Response,
+use crate::{
+    config::ProxyConfig,
+    http::{get_content_length, proxy_rewrite_request, Headers, HttpVersion, Request, Response},
 };
 
 const MAX_HEADER_SIZE: usize = 8096;
@@ -31,6 +25,7 @@ pub trait HttpReceivable: Clone {
     fn get_body(&mut self) -> &mut Vec<u8>;
     fn get_headers(&self) -> &Headers;
     fn get_http_version(&self) -> &HttpVersion;
+    fn set_headers(&mut self, key: &str, value: &str);
 }
 
 enum HttpMessage<T: HttpReceivable> {
@@ -78,9 +73,8 @@ impl<T: HttpReceivable> Default for HttpMessageHandle<T> {
     }
 }
 
-pub fn acceptor(port: u32, stream_tx: mpsc::Sender<TcpStream>) {
-    let listener =
-        TcpListener::bind(format!("127.0.0.1:{port}")).expect("Could not bind to address");
+pub fn acceptor(addr: &SocketAddr, stream_tx: mpsc::Sender<TcpStream>) {
+    let listener = TcpListener::bind(addr).expect("Failed to bind on {addr}");
 
     loop {
         for stream in listener.incoming() {
@@ -102,7 +96,7 @@ fn manage_connections(
     responses: &mut Vec<ResponseStreamHandle>,
 ) {
     // Upgrade to websocket protocol
-    for request_handle in requests {
+    for request_handle in requests.iter_mut() {
         if request_handle.mode == StreamHandleMode::UpgradeWebsocket {
             if let Some(position) = responses.iter().position(|x| {
                 std::rc::Weak::ptr_eq(&Rc::downgrade(&request_handle.client), &x.client)
@@ -118,16 +112,17 @@ fn manage_connections(
 }
 
 pub fn request_handler(
-    proxy_rules: Arc<Mutex<(usize, ProxyRules)>>,
+    proxy_rules: Arc<Mutex<ProxyConfig>>,
     stream_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
 ) {
     let mut requests: Vec<RequestStreamHandle> = Vec::new();
     let mut responses: Vec<ResponseStreamHandle> = Vec::new();
     // #TODO Do inside a loop every 5 mintes
-    let rules = match proxy_rules.lock() {
-        Ok(rules) => rules.1.clone(),
+    let rules = match proxy_rules.lock(){
+        Ok(rules) => rules,
         Err(_) => panic!("Failed to unlock proxy_rules"),
     };
+
     loop {
         register_new_clients(&mut requests, &stream_rx);
         process_requests(&mut requests);
@@ -241,9 +236,9 @@ fn process_requests(request_list: &mut Vec<RequestStreamHandle>) {
 fn send_out_requests(
     requests: &mut Vec<RequestStreamHandle>,
     responses: &mut Vec<ResponseStreamHandle>,
-    proxy_rules: &ProxyRules,
+    proxy_rules: &ProxyConfig,
 ) {
-    for stream_handle in requests {
+    for stream_handle in requests.iter_mut() {
         stream_handle.messages.retain_mut(|request_element| {
             match request_element.message {
                 HttpMessage::Ready(ref mut request) => {
