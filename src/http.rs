@@ -1,6 +1,6 @@
 use std::{collections::HashMap, str::FromStr};
 
-use crate::config::ProxyConfig;
+use crate::config::ProxyRuleConfig;
 use crate::runtime::HttpReceivable;
 use crate::runtime::HttpProxyErr;
 
@@ -223,9 +223,9 @@ impl From<&Response> for Box<[u8]> {
 }
 pub fn proxy_rewrite_request(
     request: &mut Request,
-    proxy_rules: &ProxyConfig,
+    proxy_rules: &Vec<ProxyRuleConfig>,
 ) -> Result<(), HttpProxyErr> {
-    for rule in proxy_rules.rules.iter() {
+    for rule in proxy_rules.iter() {
         if rule.matches(&request) {
             rule.rewrite(request);
             return Ok(());

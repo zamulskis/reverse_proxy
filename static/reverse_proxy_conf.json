@@ -2,42 +2,62 @@
     "example_config_1" : {
         "listener": "127.0.0.1:8080",
         "worker_count": 5,
+        "backends" : [
+            {
+                "name": "backend_1",
+                "host": "homeassistant.local:32400"
+            },
+            {
+                "name": "backend_2",
+                "host": "homeassistant.local:8123"
+            }
+        ],
         "proxy_rules": [
             {
                 "type": "proxy_rule_host",
                 "from": "127.0.0.1:8080",
-                "to": "homeassistant.local:32400"
+                "to": "backend_1"
             },
             {
                 "type": "proxy_rule_host",
                 "from": "0.0.0.0:8080",
-                "to": "homeassistant.local:32400"
+                "to": "backend_2"
             },
             {
                 "type": "proxy_rule_host",
                 "from": "localhost:8080",
-                "to": "homeassistant.local:32400"
+                "to": "backend_2"
             }
         ]
     },
     "example_config_2" : {
         "listener": "127.0.0.1:8081",
         "worker_count": 5,
+        "backends" : [
+            {
+                "name": "backend_1",
+                "host": "localhost:8000"
+            },
+            {
+                "name": "backend_2",
+                "host": "localhost:8081"
+            }
+        ],
         "proxy_rules": [
             {
                 "type": "proxy_rule_host",
                 "from": "127.0.0.1:8081",
-                "to": "homeassistant.local:8123"
+                "to": "backend_1"
             },
             {
                 "type": "proxy_rule_host",
                 "from": "0.0.0.0:8081",
-                "to": "homeassistant.local:8123"
+                "to": "backend_2"
             },
             {
                 "type": "proxy_rule_host",
                 "from": "localhost:8081",
-                "to": "homeassistant.local:8123"
+                "to": "backend_2"
             }
         ]
     }   
