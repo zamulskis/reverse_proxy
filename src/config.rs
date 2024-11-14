@@ -2,8 +2,7 @@ use core::fmt;
 use std::{
     fs, io,
     net::{AddrParseError, SocketAddr},
-    sync::{Arc, Mutex},
-    usize,
+    sync::Arc,
 };
 
 use json::JsonValue;
@@ -69,36 +68,35 @@ pub trait ProxyRule {
 
 pub struct ProxyRuleHost {
     from: Box<str>,
-    to: Box<str>,
+    to: BackendConfig,
 }
 
 impl ProxyRuleHost {
-    pub fn new(from: &str, to: &str) -> Arc<Self> {
+    pub fn new(from: &str, backend: BackendConfig) -> Arc<Self> {
         Arc::new(ProxyRuleHost {
             from: from.into(),
-            to: to.into(),
+            to: backend,
         })
     }
-}
 
-impl TryFrom<&json::object::Object> for ProxyRuleHost {
-    type Error = ProxyConfigError;
-
-    fn try_from(value: &json::object::Object) -> Result<Self, Self::Error> {
+    fn parse(
+        value: &json::object::Object,
+        backends: &Vec<BackendConfig>,
+    ) -> Result<Self, ProxyConfigError> {
         let from: &String = match value["from"] {
             JsonValue::String(ref from) => from,
             JsonValue::Short(ref from) => &from.to_string(),
             JsonValue::Null => {
                 return Err(ProxyConfigError::ConfigParamInvalid(
-                    "proxy_rule->from".into(),
-                    "proxy_rule_host must have [from] paramter".into(),
+                    "proxy_rule".into(),
+                    "must have [from] paramter".into(),
                 ))
             }
 
             _ => {
                 return Err(ProxyConfigError::ConfigParamInvalid(
                     "proxy_rule->from".into(),
-                    "proxy_rule_host [from] paramter must be a String".into(),
+                    "paramter must be a String".into(),
                 ))
             }
         };
@@ -107,21 +105,32 @@ impl TryFrom<&json::object::Object> for ProxyRuleHost {
             JsonValue::Short(ref to) => &to.to_string(),
             JsonValue::Null => {
                 return Err(ProxyConfigError::ConfigParamInvalid(
-                    "proxy_rule->to".into(),
-                    "proxy_rule_host must have [to] paramter".into(),
+                    "proxy_rule".into(),
+                    "proxy_rule must have [to] paramter".into(),
                 ))
             }
 
             _ => {
                 return Err(ProxyConfigError::ConfigParamInvalid(
                     "proxy_rule->to".into(),
-                    "proxy_rule_host [to] paramter must be a String".into(),
+                    "paramter must be a String".into(),
                 ))
             }
         };
+
+        let backend = match backends.iter().find(|&x| &x.name.to_string() == to) {
+            Some(backend) => backend,
+            None => {
+                return Err(ProxyConfigError::ConfigParamInvalid(
+                    "proxy_rule->to".into(),
+                    "Must be a valid backend name".into(),
+                ))
+            }
+        }
+        .clone();
         return Ok(ProxyRuleHost {
             from: from.clone().into(),
-            to: to.clone().into(),
+            to: backend,
         });
     }
 }
@@ -132,27 +141,34 @@ impl ProxyRule for ProxyRuleHost {
     }
 
     fn rewrite(&self, request: &mut Request) {
-        request.set_headers("Host", &self.to);
+        request.set_headers("Host", &self.to.host);
     }
 }
 
-// pub type ProxyRules = Vec<Arc<ProxyRule + Send + Sync>>;
-//
-pub struct ProxyConfig {
-    pub rules: Vec<Box<dyn ProxyRule + Sync + Send>>,
+#[derive(Clone)]
+pub struct ProxyRuleConfig {
+    rule: Arc<dyn ProxyRule + Sync + Send>,
 }
-
-impl ProxyConfig {
-    fn new() -> Self {
-        return ProxyConfig { rules: Vec::new() };
+impl ProxyRuleConfig {
+    pub fn matches(&self, request: &Request) -> bool {
+        self.rule.matches(request)
     }
+    pub fn rewrite(&self, request: &mut Request) {
+        self.rule.rewrite(request);
+    }
+}
+#[derive(Clone, PartialEq)]
+pub struct BackendConfig {
+    name: Box<str>,
+    host: Box<str>,
 }
 
 pub struct ServerConfig {
     pub server_name: Box<str>,
     pub listener_addr: SocketAddr,
     pub worker_count: usize,
-    pub proxy_rules: Arc<Mutex<ProxyConfig>>,
+    pub proxy_rules: Vec<ProxyRuleConfig>,
+    pub backends: Vec<BackendConfig>,
 }
 
 pub fn parse_config_file(path: &str) -> Result<Vec<ServerConfig>, ProxyConfigError> {
@@ -166,7 +182,8 @@ fn parse_config_json(config_json: &JsonValue) -> Result<Vec<ServerConfig>, Proxy
     match config_json {
         JsonValue::Object(ref config) => {
             for (server_name, server_config) in config.iter() {
-                result.push(parse_server_object(server_name, server_config)?);
+                let server_object = parse_server_object(server_name, server_config)?;
+                result.push(server_object);
             }
         }
         _ => {
@@ -229,11 +246,23 @@ fn parse_server_object(
                 }
             };
 
+            let backends = match server_data["backends"] {
+                JsonValue::Array(ref backends) => backends,
+                _ => {
+                    return Err(ProxyConfigError::ConfigParamInvalid(
+                        "backens".into(),
+                        format!("paramter has to be an Array").into(),
+                    ))
+                }
+            };
+
+            let backends = parse_backends(&backends)?;
             Ok(ServerConfig {
                 server_name: server_name.into(),
                 listener_addr,
                 worker_count,
-                proxy_rules: parse_proxy_rules(&proxy_rules)?,
+                proxy_rules: parse_proxy_rules(&proxy_rules, &backends)?,
+                backends,
             })
         }
         _ => Err(ProxyConfigError::ServerConfigIsNotAnObject(
@@ -242,20 +271,78 @@ fn parse_server_object(
     }
 }
 
+fn parse_backends(backends: &Vec<JsonValue>) -> Result<Vec<BackendConfig>, ProxyConfigError> {
+    let mut backend_list: Vec<BackendConfig> = Vec::new();
+    for backend in backends {
+        let backend = parse_backend_config(&backend)?;
+        if backend_list
+            .iter()
+            .position(|x| &x.name == &backend.name)
+            .is_some()
+        {
+            return Err(ProxyConfigError::ConfigParamInvalid(
+                "backends->name".into(),
+                "has to be unique in the server scope".into(),
+            ));
+        }
+        backend_list.push(backend);
+    }
+    Ok(backend_list)
+}
+
+fn parse_backend_config(object: &JsonValue) -> Result<BackendConfig, ProxyConfigError> {
+    match object {
+        JsonValue::Object(object) => {
+            let host = match object["host"] {
+                JsonValue::String(ref host) => host,
+                JsonValue::Short(ref host) => &host.to_string(),
+                _ => {
+                    return Err(ProxyConfigError::ConfigParamInvalid(
+                        "backends->host".into(),
+                        "must be a string".into(),
+                    ))
+                }
+            };
+            let name = match object["name"] {
+                JsonValue::String(ref name) => name,
+                JsonValue::Short(ref name) => &name.to_string(),
+                _ => {
+                    return Err(ProxyConfigError::ConfigParamInvalid(
+                        "backends->name".into(),
+                        "must be a string".into(),
+                    ))
+                }
+            };
+
+            Ok(BackendConfig {
+                name: name[..].into(),
+                host: host[..].into(),
+            })
+        }
+        _ => {
+            return Err(ProxyConfigError::BadConfigFormat(
+                "backend paramter should be an object".into(),
+            ))
+        }
+    }
+}
+
 fn parse_proxy_rules(
     proxy_rules: &Vec<JsonValue>,
-) -> Result<Arc<Mutex<ProxyConfig>>, ProxyConfigError> {
-    let mut proxy_config = ProxyConfig::new();
+    backends: &Vec<BackendConfig>,
+) -> Result<Vec<ProxyRuleConfig>, ProxyConfigError> {
+    let mut proxy_config: Vec<ProxyRuleConfig> = Vec::new();
     for proxy_rule in proxy_rules {
-        proxy_config.rules.push(parse_config_rule(&proxy_rule)?);
+        proxy_config.push(parse_config_rule(&proxy_rule, backends)?);
     }
 
-    Ok(Arc::new(Mutex::new(proxy_config)))
+    Ok(proxy_config)
 }
 
 fn parse_config_rule(
     object: &JsonValue,
-) -> Result<Box<dyn ProxyRule + Send + Sync>, ProxyConfigError> {
+    backends: &Vec<BackendConfig>,
+) -> Result<ProxyRuleConfig, ProxyConfigError> {
     match object {
         JsonValue::Object(object) => {
             let rule_type = match object["type"] {
@@ -269,7 +356,9 @@ fn parse_config_rule(
                 }
             };
             if rule_type == "proxy_rule_host" {
-                return Ok(Box::new(ProxyRuleHost::try_from(object)?));
+                return Ok(ProxyRuleConfig {
+                    rule: Arc::new(ProxyRuleHost::parse(object, backends)?),
+                });
             }
             Err(ProxyConfigError::ConfigParamInvalid(
                 "proxy_rule->type".into(),
@@ -294,29 +383,74 @@ mod tests {
 
     #[test]
     fn test_json_parse_config_rule() {
+        let backend_intput = r#"
+        [
+            {
+                "name": "backend_1",
+                "host": "localhost:8000"
+            },
+            {
+                "name": "backend_2",
+                "host": "localhost:8081"
+            }
+        ]
+        "#;
+
+        let json_input = json::parse(&backend_intput).expect("Failed to parse json");
+        assert!(json_input.is_array());
+        let json_input = match json_input {
+            JsonValue::Array(array) => array,
+            _ => panic!("Backends should be json array"),
+        };
+
+        let backends = parse_backends(&json_input);
+
         let input = r#"{
                 "type": "proxy_rule_host",
                 "from": "127.0.0.1:8080",
-                "to": "test_host.com:1234"
+                "to": "backend_2"
             }"#;
 
         let json_input = json::parse(input).expect("Failed to parse json");
         assert!(json_input.is_object());
-        let rule = parse_config_rule(&json_input);
+        let rule = parse_config_rule(&json_input, &backends.unwrap());
         assert!(rule.is_ok());
     }
 
     #[test]
     fn test_json_parse_proxy_rule_host() {
+        let backend_intput = r#"
+        [
+            {
+                "name": "backend_1",
+                "host": "localhost:8000"
+            },
+            {
+                "name": "backend_2",
+                "host": "localhost:8081"
+            }
+        ]
+        "#;
+
+        let json_input = json::parse(&backend_intput).expect("Failed to parse json");
+        assert!(json_input.is_array());
+        let json_input = match json_input {
+            JsonValue::Array(array) => array,
+            _ => panic!("Backends should be json array"),
+        };
+
+        let backends = parse_backends(&json_input);
+
+
         let input = r#"{
                 "type": "proxy_rule_host",
                 "from": "127.0.0.1:8080",
-                "to": "test_host.com:123"
+                "to": "backend_1"
             }"#;
 
         let json_input = json::parse(input).expect("Failed to parse json");
         let proxy_rule = match json_input {
-            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            JsonValue::Object(ref object) => ProxyRuleHost::parse(object, &backends.unwrap()),
             _ => {
                 assert!(false);
                 return;
@@ -325,7 +459,7 @@ mod tests {
         assert!(proxy_rule.is_ok());
         let proxy_rule = proxy_rule.unwrap();
         assert!(proxy_rule.from == "127.0.0.1:8080".into());
-        assert!(proxy_rule.to == "test_host.com:123".into());
+        assert!(proxy_rule.to.host == "localhost:8000".into());
     }
 
     #[test]
@@ -335,16 +469,26 @@ mod tests {
             "test" : {
                 "listener": "127.0.0.1:8081",
                 "worker_count": 5,
+                "backends": [
+                    {
+                        "name": "backend_1",
+                        "host": "localhost:8000"
+                    },
+                    {
+                        "name": "backend_2",
+                        "host": "localhost:8081"
+                    }
+                ],
                 "proxy_rules": [
                     {
                         "type": "proxy_rule_host",
                         "from": "127.0.0.1:8081",
-                        "to": "google.com:443"
+                        "to": "backend_1"
                     },
                     {
                         "type": "proxy_rule_host",
                         "from": "localhost:8081",
-                        "to": "1.1.1.1:8123"
+                        "to": "backend_2"
                     }
                 ]
             }
@@ -356,7 +500,8 @@ mod tests {
                 assert!(server_config.server_name == "test".into());
                 assert!(server_config.listener_addr == "127.0.0.1:8081".parse().unwrap());
                 assert!(server_config.worker_count == 5);
-                assert!(server_config.proxy_rules.lock().unwrap().rules.len() == 2);
+                assert!(server_config.proxy_rules.len() == 2);
+                assert!(server_config.backends.len() == 2);
             }
             Err(e) => panic!("{e}"),
         }
@@ -369,27 +514,48 @@ mod tests {
             "test" : {
                 "listener": "127.0.0.1:8081",
                 "worker_count": 5,
+                "backends" : [
+                    {
+                        "name": "backend_1",
+                        "host": "0.0.0.0:80"
+                    }
+                ],
                 "proxy_rules": [
                     {
                         "type": "proxy_rule_host",
                         "from": "127.0.0.1:8081",
-                        "to": "google.com:443"
+                        "to": "backend_1"
                     }
                 ]
             },
             "test2" : {
                 "listener": "127.0.0.1:8081",
                 "worker_count": 2,
+                "backends" : [
+                    {
+                        "name": "backend_1",
+                        "host": "0.0.0.0:80"
+                    },
+                    {
+                        "name": "backend_2",
+                        "host": "0.0.0.0:80"
+                    },
+                    {
+                        "name": "backend_3",
+                        "host": "0.0.0.0:80"
+                    }
+                ],
+
                 "proxy_rules": [
                     {
                         "type": "proxy_rule_host",
                         "from": "127.0.0.1:8081",
-                        "to": "google.com:443"
+                        "to": "backend_1"
                     },
                     {
                         "type": "proxy_rule_host",
                         "from": "localhost:8081",
-                        "to": "1.1.1.1:8123"
+                        "to": "backend_3"
                     }
                 ]
             }
@@ -401,28 +567,51 @@ mod tests {
             Ok(config) => {
                 assert!(config.len() == 2);
                 assert!(config.first().unwrap().worker_count == 5);
-                assert!(config.first().unwrap().proxy_rules.lock().unwrap().rules.len() == 1);
+                assert!(config.first().unwrap().proxy_rules.len() == 1);
                 assert!(config.first().unwrap().server_name == "test".into());
 
                 assert!(config.last().unwrap().server_name == "test2".into());
                 assert!(config.last().unwrap().worker_count == 2);
-                assert!(config.last().unwrap().proxy_rules.lock().unwrap().rules.len() == 2);
+                assert!(config.last().unwrap().proxy_rules.len() == 2);
             }
             Err(e) => panic!("{e}"),
         }
     }
     #[test]
     fn test_json_parse_proxy_rule_host_failed() {
+    let backend_intput = r#"
+        [
+            {
+                "name": "backend_1",
+                "host": "localhost:8000"
+            },
+            {
+                "name": "backend_2",
+                "host": "localhost:8081"
+            }
+        ]
+        "#;
+
+        let json_input = json::parse(&backend_intput).expect("Failed to parse json");
+        assert!(json_input.is_array());
+        let json_input = match json_input {
+            JsonValue::Array(array) => array,
+            _ => panic!("Backends should be json array"),
+        };
+
+        let backends = parse_backends(&json_input).unwrap();
+
+
         // Fail because from not present
         let input = r#"{
                 "type": "proxy_rule_host",
                 "fro": "127.0.0.1:8080",
-                "to": "test_host.com:123"
+                "to": "backend_1"
             }"#;
 
         let json_input = json::parse(input).expect("Failed to parse json");
         let proxy_rule = match json_input {
-            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            JsonValue::Object(ref object) => ProxyRuleHost::parse(object, &backends),
             _ => {
                 assert!(false);
                 return;
@@ -432,7 +621,7 @@ mod tests {
 
         match proxy_rule.err().unwrap() {
             ProxyConfigError::ConfigParamInvalid(param_name, _) => {
-                assert!(param_name == "proxy_rule->from".into());
+                assert!(param_name == "proxy_rule".into());
             }
             _ => panic!("Bad error type"),
         }
@@ -441,12 +630,57 @@ mod tests {
         let input = r#"{
                 "type": "proxy_rule_host",
                 "from": "127.0.0.1:8080",
-                "t": "test_host.com:123"
+                "t": "backend_1" }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        let proxy_rule = match json_input {
+            JsonValue::Object(ref object) => ProxyRuleHost::parse(object, &backends),
+            _ => {
+                assert!(false);
+                return;
+            }
+        };
+        assert!(proxy_rule.is_err());
+        match proxy_rule.err().unwrap() {
+            ProxyConfigError::ConfigParamInvalid(param_name, _) => {
+                assert!(param_name == "proxy_rule".into());
+            }
+            _ => panic!("Bad error type"),
+        }
+
+        // Fail because from is not a string
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "from": 5,
+                "to": "backend_2"
             }"#;
 
         let json_input = json::parse(input).expect("Failed to parse json");
         let proxy_rule = match json_input {
-            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
+            JsonValue::Object(ref object) => ProxyRuleHost::parse(object, &backends),
+            _ => {
+                assert!(false);
+                return;
+            }
+        };
+        assert!(proxy_rule.is_err());
+        match proxy_rule.err().unwrap() {
+            ProxyConfigError::ConfigParamInvalid(param_name, _) => {
+                assert!(param_name == "proxy_rule->from".into());
+            }
+            _ => panic!("Bad error type"),
+        }
+
+        // Fail because not pointing to a backend
+        let input = r#"{
+                "type": "proxy_rule_host",
+                "from": "0.0.0.0:8080",
+                "to": "backend_21"
+            }"#;
+
+        let json_input = json::parse(input).expect("Failed to parse json");
+        let proxy_rule = match json_input {
+            JsonValue::Object(ref object) => ProxyRuleHost::parse(object, &backends),
             _ => {
                 assert!(false);
                 return;
@@ -459,28 +693,38 @@ mod tests {
             }
             _ => panic!("Bad error type"),
         }
+    }
 
-        // Fail because from is not a string
-        let input = r#"{
-                "type": "proxy_rule_host",
-                "from": 5,
-                "to": "test_host.com:123"
-            }"#;
+    #[test]
+    fn test_json_parse_backends() {
+        let input = r#"
+        [
+            {
+                "name": "backend_1",
+                "host": "localhost:8000"
+            },
+            {
+                "name": "backend_2",
+                "host": "localhost:8081"
+            }
+        ]
+        "#;
 
         let json_input = json::parse(input).expect("Failed to parse json");
-        let proxy_rule = match json_input {
-            JsonValue::Object(ref object) => ProxyRuleHost::try_from(object),
-            _ => {
-                assert!(false);
-                return;
-            }
+        assert!(json_input.is_array());
+        let json_input = match json_input {
+            JsonValue::Array(array) => array,
+            _ => panic!("Backends should be json array"),
         };
-        assert!(proxy_rule.is_err());
-        match proxy_rule.err().unwrap() {
-            ProxyConfigError::ConfigParamInvalid(param_name, _) => {
-                assert!(param_name == "proxy_rule->from".into());
-            }
-            _ => panic!("Bad error type"),
-        }
+
+        let parsed = parse_backends(&json_input);
+        assert!(parsed.is_ok());
+        let backends = parsed.unwrap();
+        let backend_1 = backends.get(0).unwrap();
+        let backend_2 = backends.get(1).unwrap();
+
+        assert!(backend_1.name == "backend_1".into());
+        assert!(backend_2.name == "backend_2".into());
+        assert!(backend_2.host == "localhost:8081".into());
     }
 }

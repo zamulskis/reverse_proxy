@@ -3,7 +3,7 @@ use std::{
 };
 
 use crate::{
-    config::ProxyConfig,
+    config::{ProxyRuleConfig, ServerConfig},
     http::{get_content_length, proxy_rewrite_request, Headers, HttpVersion, Request, Response},
 };
 
@@ -112,21 +112,16 @@ fn manage_connections(
 }
 
 pub fn request_handler(
-    proxy_rules: Arc<Mutex<ProxyConfig>>,
-    stream_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+    proxy_rules: Vec<ProxyRuleConfig>,
+    stream_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>
 ) {
     let mut requests: Vec<RequestStreamHandle> = Vec::new();
     let mut responses: Vec<ResponseStreamHandle> = Vec::new();
-    // #TODO Do inside a loop every 5 mintes
-    let rules = match proxy_rules.lock(){
-        Ok(rules) => rules,
-        Err(_) => panic!("Failed to unlock proxy_rules"),
-    };
 
     loop {
         register_new_clients(&mut requests, &stream_rx);
         process_requests(&mut requests);
-        send_out_requests(&mut requests, &mut responses, &rules);
+        send_out_requests(&mut requests, &mut responses, &proxy_rules);
         process_responses(&mut responses);
         send_out_responses(&mut responses);
         manage_connections(&mut requests, &mut responses);
@@ -236,7 +231,7 @@ fn process_requests(request_list: &mut Vec<RequestStreamHandle>) {
 fn send_out_requests(
     requests: &mut Vec<RequestStreamHandle>,
     responses: &mut Vec<ResponseStreamHandle>,
-    proxy_rules: &ProxyConfig,
+    proxy_rules: &Vec<ProxyRuleConfig>,
 ) {
     for stream_handle in requests.iter_mut() {
         stream_handle.messages.retain_mut(|request_element| {
@@ -244,16 +239,13 @@ fn send_out_requests(
                 HttpMessage::Ready(ref mut request) => {
                     // TODO handle this..
                     proxy_rewrite_request(request, proxy_rules);
-                    let host = request
-                        .get_headers()
-                        .get("Host")
-                        .expect("No Host in request");
 
                     if request.get_http_version() == &HttpVersion::HTTPv1_1 {
                         // Try find existing TcpStream to the server from the same client stream.
+                        // It migth be better to use a hashmap. Will have to measure what client
+                        // measure at what client count hashmap will become faster
                         if let Some(position) = responses.iter().position(|x| {
                             std::rc::Weak::ptr_eq(&Rc::downgrade(&stream_handle.client), &x.client)
-                                && &x.host == host
                         }) {
                             let _ = send_http_request(
                                 &request,
