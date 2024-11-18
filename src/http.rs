@@ -1,15 +1,15 @@
 use std::{collections::HashMap, str::FromStr};
 
+use crate::config::BackendConfig;
 use crate::config::ProxyRuleConfig;
-use crate::runtime::HttpReceivable;
 use crate::runtime::HttpProxyErr;
+use crate::runtime::HttpTransmittable;
 
 pub type Headers = HashMap<Box<str>, Box<str>>;
 #[derive(Clone, PartialEq)]
 pub enum HttpVersion {
     HTTPv1,
     HTTPv1_1,
-    HTTPv2,
 }
 
 #[derive(Clone)]
@@ -17,8 +17,6 @@ enum HttpMethod {
     GET,
     POST,
 }
-
-
 
 #[derive(Clone)]
 pub struct RequestHeader {
@@ -48,7 +46,7 @@ pub struct Request {
     body: Vec<u8>,
 }
 
-impl HttpReceivable for Request {
+impl HttpTransmittable for Request {
     fn parse_headers(buf: &[u8]) -> Result<(Request, usize), HttpProxyErr> {
         let end_line_pos = find_in_u8_slice(&buf, b"\r\n");
         if end_line_pos.is_none() {
@@ -86,16 +84,16 @@ impl HttpReceivable for Request {
         &self.header.headers
     }
 
-    fn set_headers(&mut self, key: &str, value:&str) {
+    fn set_headers(&mut self, key: &str, value: &str) {
         self.header.headers.insert(key.into(), value.into());
     }
 
-    fn get_http_version(&self) -> &HttpVersion {
-        return &self.header.version;
+    fn to_vec_u8(&self) -> Vec<u8> {
+        self.into()
     }
 }
 
-impl HttpReceivable for Response {
+impl HttpTransmittable for Response {
     fn parse_headers(buf: &[u8]) -> Result<(Response, usize), HttpProxyErr> {
         let end_line_pos = find_in_u8_slice(&buf, b"\r\n");
         if end_line_pos.is_none() {
@@ -127,12 +125,12 @@ impl HttpReceivable for Response {
         &self.header.headers
     }
 
-    fn get_http_version(&self) -> &HttpVersion {
-        return &self.header.version;
+    fn set_headers(&mut self, key: &str, value: &str) {
+        self.header.headers.insert(key.into(), value.into());
     }
 
-    fn set_headers(&mut self, key: &str, value:&str) {
-        self.header.headers.insert(key.into(), value.into());
+    fn to_vec_u8(&self) -> Vec<u8> {
+        self.into()
     }
 }
 
@@ -153,7 +151,6 @@ impl ToString for HttpVersion {
         match self {
             HttpVersion::HTTPv1_1 => return "HTTP/1.1".to_string(),
             HttpVersion::HTTPv1 => return "HTTP/1.0".to_string(),
-            _ => panic!("Trying to construct unsupported http version"),
         }
     }
 }
@@ -180,81 +177,60 @@ impl ToString for HttpMethod {
     }
 }
 
-impl From<&Request> for Box<[u8]> {
-    fn from(request: &Request) -> Box<[u8]> {
+impl Into<Vec<u8>> for &Request {
+    fn into(self) -> Vec<u8> {
         let mut buffer: Vec<u8> = Vec::new();
-        buffer.extend(request.header.method.to_string().as_bytes());
+        buffer.extend(self.header.method.to_string().as_bytes());
         buffer.extend(b" ");
-        buffer.extend(request.header.uri.as_bytes());
+        buffer.extend(self.header.uri.as_bytes());
         buffer.extend(b" ");
-        buffer.extend(request.header.version.to_string().as_bytes());
+        buffer.extend(self.header.version.to_string().as_bytes());
         buffer.extend(b"\r\n");
-        for (key, value) in request.header.headers.iter() {
+        for (key, value) in self.header.headers.iter() {
             buffer.extend(key.as_bytes());
             buffer.extend(b": ");
             buffer.extend(value.as_bytes());
             buffer.extend(b"\r\n");
         }
         buffer.extend(b"\r\n");
-        buffer.extend(request.body.iter());
-        return buffer.into_boxed_slice();
+        buffer.extend(self.body.iter());
+        return buffer;
     }
 }
 
-impl From<&Response> for Box<[u8]> {
-    fn from(response: &Response) -> Box<[u8]> {
+impl Into<Vec<u8>> for &Response {
+    fn into(self) -> Vec<u8> {
         let mut buffer: Vec<u8> = Vec::new();
-        buffer.extend(response.header.version.to_string().as_bytes());
+        buffer.extend(self.header.version.to_string().as_bytes());
         buffer.extend(b" ");
-        buffer.extend(response.header.status_code.to_string().as_bytes());
+        buffer.extend(self.header.status_code.to_string().as_bytes());
         buffer.extend(b" ");
-        buffer.extend(response.header.msg.as_bytes());
+        buffer.extend(self.header.msg.as_bytes());
         buffer.extend(b"\r\n");
-        for (key, value) in response.header.headers.iter() {
+        for (key, value) in self.header.headers.iter() {
             buffer.extend(key.as_bytes());
             buffer.extend(b": ");
             buffer.extend(value.as_bytes());
             buffer.extend(b"\r\n");
         }
         buffer.extend(b"\r\n");
-        buffer.extend(response.body.iter());
-        return buffer.into_boxed_slice();
+        buffer.extend(self.body.iter());
+        return buffer;
     }
 }
-pub fn proxy_rewrite_request(
+pub fn proxy_rewrite_request<'a>(
     request: &mut Request,
-    proxy_rules: &Vec<ProxyRuleConfig>,
-) -> Result<(), HttpProxyErr> {
+    proxy_rules: &'a Vec<ProxyRuleConfig>,
+) -> Result<&'a BackendConfig, HttpProxyErr> {
     for rule in proxy_rules.iter() {
         if rule.matches(&request) {
             rule.rewrite(request);
-            return Ok(());
+            return Ok(rule.backend());
         }
     }
     return Err(HttpProxyErr::ProxyRuleNotFound);
 }
 
-// fn make_err_response(
-//     error_code: u32,
-//     status_msg: &str,
-//     message: &str,
-//     stream_client: Weak<Mutex<TcpStream>>,
-// ) -> Response {
-//     let mut headers: HashMap<Box<str>, Box<str>> = HashMap::new();
-//     headers.insert("Content-Type".into(), "text/html".into());
-//     headers.insert("Content-Length".into(), message.len().to_string().into());
-//     let response = Response {
-//         header: ResponseHeader {
-//             headers,
-//             msg: status_msg.into(),
-//             version: HttpVersion::HTTPv1_1,
-//             status_code: error_code,
-//         },
-//         body: message.into(),
-//         stream_client,
-//     };
-//     return response;
-// }
 
 fn find_in_u8_slice(slice: &[u8], target: &[u8]) -> Option<usize> {
     for window in slice.windows(target.len()) {
@@ -314,6 +290,7 @@ fn parse_request_line(buf: &[u8]) -> Result<(HttpMethod, Box<str>, HttpVersion),
 fn parse_status_line(buf: &[u8]) -> Result<(HttpVersion, u32, Box<str>), HttpProxyErr> {
     match std::str::from_utf8(buf) {
         Ok(line) => {
+            // println!("response line {line}");
             let mut parts = line.split(' ');
 
             let version = parts.next();

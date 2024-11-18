@@ -7,10 +7,11 @@
 - **Listen on multiple ports:** Apply different proxy rules depending on the port.
 - **Configurable worker pool:** Each port can have a variable number of workers to handle traffic.
 - **WebSocket support:** Enabled by default.
+- **Backend HTTPS support:** Support HTTPS backends.
 
 ## Tech Stack
 
-This project is written in **pure Rust** using only the standard library. The only external crate used is for JSON parsing.
+All the threading and I/O is done with rust std lib.
 
 ## Installation & Usage
 
@@ -37,7 +38,9 @@ The proxy configuration should be placed in the file ./static/reverse_proxy_conf
 * worker_count: The number of workers to handle requests for this listener.
 * backends: A list of backends that proxy_rules could refer to.
     * name: Name of the backend.
-    * host: Address it points to.
+    * host: IP/or hostname.
+    * hostname: Value that gets put in host header.
+    * https: Optional flag to decide if we should use https for backend connections.
 * proxy_rules: A list of proxy rules defining how incoming traffic should be forwarded. Each rule consists of:
     * type: The type of proxy rule (e.g., proxy_rule_host).
     * from: The source address (host
@@ -50,15 +53,20 @@ The proxy configuration should be placed in the file ./static/reverse_proxy_conf
 {
     "example_config_1" : {
         "listener": "127.0.0.1:8080",
-        "worker_count": 5,
+        "worker_count": 1,
         "backends" : [
             {
                 "name": "backend_1",
-                "host": "homeassistant.local:32400"
+                "host": "homeassistant.local",
+                "hostname": "homeassistant.local",
+                "port": 32400
             },
             {
                 "name": "backend_2",
-                "host": "homeassistant.local:8123"
+                "host": "www.google.com",
+                "hostname": "www.google.com",
+                "port": 443,
+                "https": true 
             }
         ],
         "proxy_rules": [
@@ -70,7 +78,7 @@ The proxy configuration should be placed in the file ./static/reverse_proxy_conf
             {
                 "type": "proxy_rule_host",
                 "from": "0.0.0.0:8080",
-                "to": "backend_2"
+                "to": "backend_1"
             },
             {
                 "type": "proxy_rule_host",
@@ -79,17 +87,15 @@ The proxy configuration should be placed in the file ./static/reverse_proxy_conf
             }
         ]
     },
-    "example_config_2" : {
+    "example_config_2" : { 
         "listener": "127.0.0.1:8081",
-        "worker_count": 5,
+        "worker_count": 1,
         "backends" : [
             {
                 "name": "backend_1",
-                "host": "localhost:8000"
-            },
-            {
-                "name": "backend_2",
-                "host": "localhost:8081"
+                "host": "localhost",
+                "hostname": "testwebsite.com",
+                "port": 8000
             }
         ],
         "proxy_rules": [
@@ -97,16 +103,6 @@ The proxy configuration should be placed in the file ./static/reverse_proxy_conf
                 "type": "proxy_rule_host",
                 "from": "127.0.0.1:8081",
                 "to": "backend_1"
-            },
-            {
-                "type": "proxy_rule_host",
-                "from": "0.0.0.0:8081",
-                "to": "backend_2"
-            },
-            {
-                "type": "proxy_rule_host",
-                "from": "localhost:8081",
-                "to": "backend_2"
             }
         ]
     }   
