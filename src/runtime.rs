@@ -5,8 +5,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc,
     },
-    thread::sleep,
-    time::{Duration, Instant},
 };
 
 use rustls::ClientConnection;
@@ -19,11 +17,6 @@ use crate::{
 const MAX_HEADER_SIZE: usize = 16384;
 const MAX_TCP_PACKET_SIZE: usize = 655350;
 
-#[derive(Debug)]
-pub enum TlsError {
-    UnnableToGetBackendServerName,
-    UnnableToCreateTlsConnection,
-}
 
 #[derive(Debug)]
 pub enum HttpProxyErr {
@@ -34,7 +27,7 @@ pub enum HttpProxyErr {
     UnnableToConnect,
     MaxHeaderSizeExceeded,
     CorruptedClientConnection,
-    TlsError(TlsError),
+    TlsError,
 }
 
 pub trait HttpTransmittable: Clone {
@@ -377,17 +370,13 @@ fn setup_tls_backend_socket(
         match backend.host.to_string().try_into() {
             Ok(server_name) => server_name,
             Err(_) => {
-                return Err(HttpProxyErr::TlsError(
-                    TlsError::UnnableToGetBackendServerName,
-                ))
+                return Err(HttpProxyErr::TlsError)
             }
         };
     let conn = match rustls::ClientConnection::new(Arc::new(config), server_name) {
         Ok(conn) => conn,
         Err(_) => {
-            return Err(HttpProxyErr::TlsError(
-                TlsError::UnnableToCreateTlsConnection,
-            ))
+            return Err(HttpProxyErr::TlsError)
         }
     };
     let tls_stream = rustls::StreamOwned::new(conn, stream);
