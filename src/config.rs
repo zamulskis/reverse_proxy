@@ -2,12 +2,12 @@ use core::fmt;
 use std::{
     fs, io,
     net::{AddrParseError, SocketAddr},
-    sync::Arc,
+    sync::Arc, usize,
 };
 
 use json::JsonValue;
 
-use crate::{http::Request, runtime::HttpReceivable};
+use crate::{http::Request, runtime::HttpTransmittable};
 
 #[derive(Debug)]
 pub enum ProxyConfigError {
@@ -64,6 +64,7 @@ impl fmt::Display for ProxyConfigError {
 pub trait ProxyRule {
     fn matches(&self, request: &Request) -> bool;
     fn rewrite(&self, request: &mut Request);
+    fn backend(&self) -> &BackendConfig;
 }
 
 pub struct ProxyRuleHost {
@@ -143,6 +144,10 @@ impl ProxyRule for ProxyRuleHost {
     fn rewrite(&self, request: &mut Request) {
         request.set_headers("Host", &self.to.host);
     }
+
+    fn backend(&self) -> &BackendConfig {
+        &self.to
+    }
 }
 
 #[derive(Clone)]
@@ -156,11 +161,16 @@ impl ProxyRuleConfig {
     pub fn rewrite(&self, request: &mut Request) {
         self.rule.rewrite(request);
     }
+    pub fn backend(&self) -> &BackendConfig {
+        self.rule.backend()
+    }
 }
 #[derive(Clone, PartialEq)]
 pub struct BackendConfig {
     name: Box<str>,
-    host: Box<str>,
+    pub host: Box<str>,
+    pub https: bool,
+    pub port: usize,
 }
 
 pub struct ServerConfig {
@@ -314,9 +324,44 @@ fn parse_backend_config(object: &JsonValue) -> Result<BackendConfig, ProxyConfig
                 }
             };
 
+            let https = match object["https"] {
+                JsonValue::Boolean(https) => https,
+                JsonValue::Null => false,
+                _ => {
+                    return Err(ProxyConfigError::ConfigParamInvalid(
+                        "backends->https".into(),
+                        "must be a boolean".into(),
+                    ))
+                }
+            };
+
+            let port :f64= match object["port"] {
+                JsonValue::Number(port) => port.into(), 
+                _ => {
+                    return Err(ProxyConfigError::ConfigParamInvalid(
+                        "backends->port".into(),
+                        "must be a number".into(),
+                    ))
+                }
+            };
+
+            let port: usize = if port >= 0.0 && port <= usize::MAX as f64 {
+                port as usize
+            } else {
+                return Err(ProxyConfigError::ConfigParamInvalid(
+                    "worker_count".into(),
+                    format!("parameter has to be > 0 and < {}", usize::MAX).into(),
+                ));
+            };
+
+
+            
+
             Ok(BackendConfig {
                 name: name[..].into(),
                 host: host[..].into(),
+                https,
+                port
             })
         }
         _ => {
@@ -440,7 +485,6 @@ mod tests {
         };
 
         let backends = parse_backends(&json_input);
-
 
         let input = r#"{
                 "type": "proxy_rule_host",
@@ -579,7 +623,7 @@ mod tests {
     }
     #[test]
     fn test_json_parse_proxy_rule_host_failed() {
-    let backend_intput = r#"
+        let backend_intput = r#"
         [
             {
                 "name": "backend_1",
@@ -600,7 +644,6 @@ mod tests {
         };
 
         let backends = parse_backends(&json_input).unwrap();
-
 
         // Fail because from not present
         let input = r#"{
